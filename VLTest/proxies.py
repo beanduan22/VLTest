@@ -17,13 +17,15 @@ def make_relation_proxies(
     image_threshold: float,
     alignment_ratio: float,
     negative_margin: float,
+    reconstruction=None,
 ) -> Proxies:
     task = task.lower()
     if task not in {"itm", "vr", "nlvr", "vqa"}:
         raise ValueError(f"unknown task: {task}")
     uses_alignment = task == "itm" or (task in {"vr", "nlvr"} and
                                             seed_label in {True, "True"})
-    baseline = alignment_score(seed_image, seed_text) if uses_alignment else None
+    reference = seed_image if reconstruction is None else reconstruction
+    baseline = alignment_score(reference, seed_text) if uses_alignment else None
 
     def text_ok(text, original):
         return min(entailment_probability(original, text),
@@ -61,6 +63,35 @@ def nli_scorer(tokenizer, model, device):
         return float(logits.softmax(-1)[entailment_id].item())
 
     return score
+
+
+def openclip_scorers(model, preprocess, tokenizer, device):
+    from functools import lru_cache
+
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+
+    @lru_cache(maxsize=8192)
+    @torch.no_grad()
+    def image_embedding(path):
+        with Image.open(path) as image:
+            pixels = preprocess(image.convert("RGB")).unsqueeze(0).to(device)
+        return F.normalize(model.encode_image(pixels).float(), dim=-1).cpu()
+
+    @lru_cache(maxsize=8192)
+    @torch.no_grad()
+    def text_embedding(text):
+        tokens = tokenizer([text]).to(device)
+        return F.normalize(model.encode_text(tokens).float(), dim=-1).cpu()
+
+    def image_similarity(path, seed_path):
+        return float((image_embedding(path) * image_embedding(seed_path)).sum())
+
+    def alignment(path, text):
+        return float((image_embedding(path) * text_embedding(text)).sum())
+
+    return image_similarity, alignment
 
 
 def clip_image_scorer(processor, model, device):

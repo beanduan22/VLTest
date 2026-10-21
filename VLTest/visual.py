@@ -38,6 +38,7 @@ def generate_visual_pool(
     rank_range: int,
     max_variants: int | None = None,
     model_input_key: Callable[[str], bytes] | None = None,
+    admit: Callable[[str], bool] | None = None,
 ) -> VisualPool:
     import numpy as np
     import torch
@@ -69,12 +70,17 @@ def generate_visual_pool(
         quantized, _, (_, _, indices) = vqgan.encode(tensor)
         recon_path = output / "reconstruction.png"
         save(vqgan.decode(quantized), recon_path)
+        if admit is not None and not admit(str(recon_path)):
+            return VisualPool(str(raw_seed_path), str(recon_path), [], [])
 
         original = indices.reshape(-1)
         counts = Counter(original.cpu().tolist())
         selected = [index for index, _ in
                     sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top_k]]
-        codebook = vqgan.quantize.embedding.weight.detach().cpu().numpy()
+        embedding = getattr(vqgan.quantize, "embed", None)
+        if embedding is None:
+            embedding = vqgan.quantize.embedding
+        codebook = embedding.weight.detach().cpu().numpy()
         size, dimension = codebook.shape
         if rank_range > size - 1:
             raise ValueError("rank_range exceeds the codebook")

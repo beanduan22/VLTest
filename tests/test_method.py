@@ -27,28 +27,28 @@ class DiscoveryTests(unittest.TestCase):
             ("raw", "question"): 1,
             ("recon", "question"): 1,
             ("edited", "question"): 1,
-            ("raw", "rewrite"): 1,
+            ("recon", "rewrite"): 1,
             ("edited", "rewrite"): 0,
         }
 
-    def run_discovery(self, budget=5, policy="RR", proxies=None):
+    def run_discovery(self, budget=2, policy="RR", proxies=None, joint_budget=1):
         return discover(
             seed_image="raw", seed_text="question", reconstruction="recon",
             acceptable_answers={1}, image_variants=["edited"],
             text_variants=["rewrite"], target=lambda x, t: self.answers[x, t],
-            normalize=int, budget=budget, image_arm_cap=1, text_arm_cap=1,
+            normalize=int, answer_check=lambda cell: "preserved", budget=budget, image_arm_cap=1, text_arm_cap=1, joint_budget=joint_budget,
             policy=policy, proxies=proxies)
 
     def test_arms_first_four_cell_candidate(self):
         result = self.run_discovery()
         self.assertTrue(result.admitted)
-        self.assertEqual(result.discovery_calls, 5)
+        self.assertEqual(result.discovery_calls, 3)
         self.assertEqual(len(result.joint_candidates), 1)
         self.assertEqual(result.joint_candidates[0].completion_call, 5)
         labels = {
-            ("raw", "question"): CellAnnotation(frozenset({1}), True),
+            ("recon", "question"): CellAnnotation(frozenset({1}), True),
             ("edited", "question"): CellAnnotation(frozenset({1}), True),
-            ("raw", "rewrite"): CellAnnotation(frozenset({1}), True),
+            ("recon", "rewrite"): CellAnnotation(frozenset({1}), True),
             ("edited", "rewrite"): CellAnnotation(frozenset({1}), False),
         }
         self.assertTrue(verified_joint_failure(result.joint_candidates[0], labels,
@@ -68,24 +68,25 @@ class DiscoveryTests(unittest.TestCase):
             seed_image="raw", seed_text="question", reconstruction="recon",
             acceptable_answers={1}, image_variants=["edited"],
             text_variants=["rewrite"], target=target, normalize=int,
+            answer_check=lambda cell: "preserved",
             budget=5, image_arm_cap=1, text_arm_cap=1, seed_output=1)
-        self.assertEqual(result.discovery_calls, 5)
+        self.assertEqual(result.discovery_calls, 3)
         self.assertEqual(len(calls), 4)
-        self.assertEqual(result.log[0].purpose, "seed")
+        self.assertEqual(result.log[0].purpose, "raw_seed")
 
     def test_identical_reconstruction_reuses_seed_observation(self):
         result = discover(
             seed_image="raw", seed_text="question", reconstruction="raw",
             acceptable_answers={1}, image_variants=[], text_variants=[],
             target=lambda image, text: self.answers[image, text],
-            normalize=int, budget=2, image_arm_cap=0, text_arm_cap=0)
-        self.assertEqual(result.discovery_calls, 1)
+            normalize=int, answer_check=lambda cell: "preserved", budget=2, image_arm_cap=0, text_arm_cap=0)
+        self.assertEqual(result.discovery_calls, 0)
         self.assertIs(result.reconstruction_observation, result.log[0])
 
     def test_joint_first_reserves_arms(self):
-        self.assertEqual(self.run_discovery(4, "JF").discovery_calls, 2)
-        result = self.run_discovery(5, "JF")
-        self.assertEqual(result.discovery_calls, 5)
+        self.assertEqual(self.run_discovery(2, "JF", joint_budget=0).discovery_calls, 0)
+        result = self.run_discovery(2, "JF")
+        self.assertEqual(result.discovery_calls, 3)
         self.assertEqual(len(result.joint_candidates), 1)
         self.assertEqual([record.purpose for record in result.log[2:]],
                          ["joint", "image_arm", "text_arm"])
@@ -96,8 +97,8 @@ class DiscoveryTests(unittest.TestCase):
         outcome = retest_joint_pattern(candidate, result.log,
                                        lambda x, t: self.answers[x, t], int, {1})
         self.assertTrue(outcome.stable)
-        self.assertEqual(outcome.verification_calls, 12)
-        responses = iter([1, 1, 1] * 3 + [1, 0, 1])
+        self.assertEqual(outcome.verification_calls, 20)
+        responses = iter([1, 1, 1, 1, 1] * 3 + [1, 0, 1, 0, 1])
         outcome = retest_joint_pattern(candidate, result.log,
                                        lambda _x, _t: next(responses), int, {1})
         self.assertFalse(outcome.stable)
@@ -105,7 +106,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_pair_proxy_filters_joint(self):
         proxies = Proxies(pair=lambda x, t: (x, t) != ("edited", "rewrite"))
         result = self.run_discovery(proxies=proxies)
-        self.assertEqual(result.discovery_calls, 4)
+        self.assertEqual(result.discovery_calls, 2)
         self.assertFalse(result.joint_candidates)
         self.assertTrue(any(row["cell_type"] == "joint" and not row["passed"]
                             for row in result.screening))
@@ -116,10 +117,10 @@ class DiscoveryTests(unittest.TestCase):
             acceptable_answers={1}, image_variants=["edited"],
             text_variants=["rewrite", "rewrite alias"],
             target=lambda x, t: self.answers[(x, "rewrite" if t == "rewrite alias" else t)],
-            normalize=int, budget=6, image_arm_cap=1, text_arm_cap=2,
+            normalize=int, answer_check=lambda cell: "preserved", budget=6, image_arm_cap=1, text_arm_cap=2,
             input_key=lambda x, t: (x, "rewrite" if t == "rewrite alias" else t),
         )
-        self.assertEqual(result.discovery_calls, 5)
+        self.assertEqual(result.discovery_calls, 3)
         self.assertEqual(len(result.joint_candidates), 1)
         self.assertTrue(any(row["duplicate"] for row in result.screening))
 
@@ -201,14 +202,14 @@ class DiscoveryTests(unittest.TestCase):
         class Quantizer(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.embedding = torch.nn.Embedding(4, 3)
+                self.embed = torch.nn.Embedding(4, 3)
                 with torch.no_grad():
-                    self.embedding.weight.copy_(torch.tensor([
+                    self.embed.weight.copy_(torch.tensor([
                         [-1., -1., -1.], [-0.5, -0.5, -0.5],
                         [0.5, 0.5, 0.5], [1., 1., 1.]]))
 
             def get_codebook_entry(self, indices, shape):
-                return self.embedding(indices).view(shape).permute(0, 3, 1, 2)
+                return self.embed(indices).view(shape).permute(0, 3, 1, 2)
 
         class VQGAN(torch.nn.Module):
             def __init__(self):

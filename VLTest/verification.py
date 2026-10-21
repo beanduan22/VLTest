@@ -4,8 +4,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+import json
 
 from method import JointCandidate, Observation
+
+_NO_OUTPUT = object()
 
 
 @dataclass(frozen=True)
@@ -58,50 +61,158 @@ class StabilityResult:
     stable: bool
     verification_calls: int
     compatible_votes: dict[tuple[Any, str], int]
+    incorrect_votes: dict[tuple[Any, str], int] | None = None
 
 
 def retest_arm_pattern(seed_cell, arm_cell, discovery_log: Iterable[Observation],
                        target, normalize, acceptable_answers: set[Any],
-                       *, repeats: int = 3) -> StabilityResult:
+                       *, repeats: int = 5, judge=None, input_key=None) -> StabilityResult:
     if repeats < 1:
         raise ValueError("repeats must be positive")
     cells = (seed_cell, arm_cell)
-    original = {observation.cell: observation for observation in discovery_log}
-    if any(cell not in original for cell in cells):
+    key = input_key or (lambda image, text: (image, text))
+    original = {key(*observation.cell): observation for observation in discovery_log}
+    if any(key(*cell) not in original for cell in cells):
         raise ValueError("arm candidate lacks discovery observations")
-    votes = {}
+    votes, incorrect_votes = {}, {}
     for cell in cells:
-        compatible = int(original[cell].normalized in acceptable_answers)
+        compatible = incorrect = 0
         for _ in range(repeats):
-            compatible += int(normalize(target(*cell)) in acceptable_answers)
+            output = target(*cell)
+            verdict = (judge(cell, output) if judge is not None else
+                       ("correct" if normalize(output) in acceptable_answers else "incorrect"))
+            compatible += int(verdict == "correct")
+            incorrect += int(verdict == "incorrect")
         votes[cell] = compatible
-    majority = (repeats + 1) // 2 + 1
+        incorrect_votes[cell] = incorrect
+    majority = repeats // 2 + 1
     stable = votes[seed_cell] >= majority and \
-        repeats + 1 - votes[arm_cell] >= majority
-    return StabilityResult(stable, repeats * len(cells), votes)
+        incorrect_votes[arm_cell] >= majority
+    return StabilityResult(stable, repeats * len(cells), votes, incorrect_votes)
 
 
 def retest_joint_pattern(candidate: JointCandidate,
                          discovery_log: Iterable[Observation], target, normalize,
-                         acceptable_answers: set[Any], *, repeats: int = 3) -> StabilityResult:
+                         acceptable_answers: set[Any], *, repeats: int = 5,
+                         judge=None, input_key=None) -> StabilityResult:
     if repeats < 1:
         raise ValueError("repeats must be positive")
     cells = (candidate.seed, candidate.image_arm,
              candidate.text_arm, candidate.joint)
-    original = {observation.cell: observation for observation in discovery_log}
-    if any(cell not in original for cell in cells):
+    key = input_key or (lambda image, text: (image, text))
+    original = {key(*observation.cell): observation for observation in discovery_log}
+    if any(key(*cell) not in original for cell in cells):
         raise ValueError("joint candidate lacks discovery observations")
-    votes = {}
+    votes, incorrect_votes = {}, {}
     for cell in cells:
-        compatible = int(original[cell].normalized in acceptable_answers)
+        compatible = incorrect = 0
         for _ in range(repeats):
-            compatible += int(normalize(target(*cell)) in acceptable_answers)
+            output = target(*cell)
+            verdict = (judge(cell, output) if judge is not None else
+                       ("correct" if normalize(output) in acceptable_answers else "incorrect"))
+            compatible += int(verdict == "correct")
+            incorrect += int(verdict == "incorrect")
         votes[cell] = compatible
-    total_votes = repeats + 1
+        incorrect_votes[cell] = incorrect
+    total_votes = repeats
     majority = total_votes // 2 + 1
     stable = all(votes[cell] >= majority for cell in cells[:3]) and \
-        total_votes - votes[cells[3]] >= majority
-    return StabilityResult(stable, repeats * len(cells), votes)
+        incorrect_votes[cells[3]] >= majority
+    return StabilityResult(stable, repeats * len(cells), votes, incorrect_votes)
+
+
+@dataclass(frozen=True)
+class OracleVerdict:
+    answer: str
+    output: str
+
+    @property
+    def correct(self):
+        return self.answer == "preserved" and self.output == "correct"
+
+    @property
+    def failure(self):
+        return self.answer == "preserved" and self.output == "incorrect"
+
+
+class VLMOracle:
+    def __init__(self, client, *, task, seed, answers, right_image=None):
+        self.client = client
+        self.task = task
+        self.seed = seed
+        self.answers = answers
+        self.right_image = right_image
+        self.answers_cache = {}
+        self.outputs_cache = {}
+
+    def _request(self, cell, instruction, output=_NO_OUTPUT):
+        reference = {"task": self.task, "seed_text": self.seed[1],
+                     "reference_answers": sorted(self.answers), "generated_text": cell[1]}
+        if output is not _NO_OUTPUT:
+            reference["model_output"] = output
+        images = [self.seed[0], cell[0]]
+        image_order = "Images are the raw seed image, then the generated image."
+        if self.right_image is not None:
+            images.append(self.right_image)
+            image_order += " The last image is the fixed second image for both VR inputs."
+        prompt = (instruction + " " + image_order + "\n" + json.dumps(reference))
+        response = self.client.complete(prompt, images)
+        try:
+            content = response.strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0]
+            verdict = json.loads(content)["verdict"]
+        except (ValueError, KeyError, TypeError):
+            verdict = "abstain"
+        return verdict if isinstance(verdict, str) else "abstain"
+
+    def answer_check(self, cell):
+        if cell not in self.answers_cache:
+            verdict = self._request(cell,
+                'Determine whether the generated input is meaningful for the task and '
+                'has the same expected answer as the seed, using the seed and reference '
+                'answers as the reference. Check image details, counts, relations and '
+                'the meaning of the text. Do not assume that a mutation preserves the '
+                'answer. No model output is supplied. Return only a JSON object with '
+                '"verdict": "preserved", "changed", "invalid", or "abstain".')
+            self.answers_cache[cell] = (verdict if verdict in
+                {"preserved", "changed", "invalid", "abstain"} else "abstain")
+        return self.answers_cache[cell]
+
+    def output_check(self, cell, output):
+        identity = (cell, json.dumps(output, sort_keys=True))
+        if identity not in self.outputs_cache:
+            verdict = self._request(cell,
+                'Judge whether model_output is a correct answer to the generated '
+                'input. Use the seed and reference answers as a reference, but '
+                'judge the actual generated input. Accept correct synonyms and '
+                'equivalent wording outside the reference answers. Return only a '
+                'JSON object with "verdict": "correct", "incorrect", or "abstain".',
+                output)
+            if self.task in {"itm", "vr", "nlvr"}:
+                from targets import normalize_binary
+                if normalize_binary(output) is None:
+                    verdict = "abstain"
+            self.outputs_cache[identity] = (verdict if verdict in
+                {"correct", "incorrect", "abstain"} else "abstain")
+        return self.outputs_cache[identity]
+
+    def judge(self, cell, output):
+        answer = self.answer_check(cell)
+        return OracleVerdict(answer, self.output_check(cell, output))
+
+
+def interaction_analysis(cells, reference_answers, joint_answer, score):
+    margins = []
+    for image, text in cells:
+        reference = max(score(image, text, answer) for answer in reference_answers)
+        margins.append(reference - score(image, text, joint_answer))
+    seed, image, text, joint = margins
+    additive = image + text - seed
+    return {"margins": margins, "additive_margin": additive,
+            "interaction_contrast": joint - image - text + seed,
+            "score_classifiable": joint <= 0,
+            "interaction_failure": additive > 0 if joint <= 0 else None}
 
 
 @dataclass(frozen=True)
