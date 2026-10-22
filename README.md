@@ -34,43 +34,6 @@ The runner writes `discovery_calls.jsonl`, `seed_summary.jsonl`, `screening.json
 
 The local target adapters cover ViLT and BLIP for ITM, ViLT and BEiT-3 for NLVR2, and PaliGemma and BEiT-3 for VQA. The paper's additional open-weight and API models require adapters and specified checkpoints before those experiments can run. The runner does not invent values for the paper's unfilled budget and threshold placeholders.
 
-## Human verification
-
-Draw candidates from the discovery population with recorded inclusion probabilities. Use `--audit-type four-cell` for a joint-only sample, or draw rejected and accepted variants from `screening.jsonl` with `--audit-type proxy`. Independent full-verification runs can use a sample size at least as large as each stratum.
-
-```bash
-python audit.py sample --input runs/vqa/candidates.jsonl \
-  --audit-type candidate --sample-size 200 --output candidate_sample.jsonl
-```
-
-Three annotators first label each selected blind cell with `candidate_id`, `cell_role`, `annotator`, `expected_answers`, `valid`, and `decidable`. A three-way reference split requires an `adjudication` row. Reveal outputs only after those reference labels are fixed:
-
-```bash
-python audit.py reveal \
-  --blind runs/vqa/annotation_reference_blind.jsonl \
-  --calls runs/vqa/discovery_calls.jsonl \
-  --sample candidate_sample.jsonl \
-  --reference-labels reference_labels.jsonl --output verdict_sheet.jsonl
-```
-
-Three annotators then provide `candidate_id`, `cell_role`, `annotator`, and `model_correct` for each row of the verdict sheet. Summarize the arm and four-cell outcomes with:
-
-```bash
-python audit.py summarize \
-  --verdict-sheet verdict_sheet.jsonl \
-  --verdict-labels verdict_labels.jsonl --output human_outcomes.jsonl
-```
-
-`verification.py` contains the four-cell decision rule, stochastic retest rule, stratified sampling helper, Horvitz–Thompson human estimator, and bias-corrected judge-assisted estimator. Judge predictions are kept separate from human labels.
-
-```bash
-python audit.py estimate --population runs/vqa/candidates.jsonl \
-  --sample candidate_sample.jsonl --outcomes human_outcomes.jsonl \
-  --measure confirmed --discovery-calls 10000 --output confirmed_estimate.json
-```
-
-For verified joint failures, use a four-cell sample and `--measure joint`. If the optional `--judge` file is supplied, it must contain `candidate_id` and a Boolean `failure` decision for every population candidate; the estimator corrects those predictions with the human audit sample. As specified in Section 5.5 of the paper, the automated oracle uses Llama-4-Maverick. The discovery runner defaults to `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, and the answer-preservation and output-correctness prompts are included in [`VLTest/verification.py`](VLTest/verification.py).
-
 ## Dependencies and assets
 
 Install the Python dependencies from `VLTest/environment.yml` and obtain the VQGAN checkpoint, target checkpoints, and auxiliary model weights used in the experiment. The BEiT-3 adapters also require the tokenizer, task checkpoints, and the original VQA `answer2label.txt` under `--assets-dir`. No verified failure counts are supplied by the code without a completed annotation audit.
