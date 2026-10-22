@@ -69,7 +69,7 @@ python audit.py estimate --population runs/vqa/candidates.jsonl \
   --measure confirmed --discovery-calls 10000 --output confirmed_estimate.json
 ```
 
-For verified joint failures, use a four-cell sample and `--measure joint`. If the optional `--judge` file is supplied, it must contain `candidate_id` and a Boolean `failure` decision for every population candidate; the estimator corrects those predictions with the human audit sample. The judge model and prompt remain unspecified in the paper, so this repository consumes frozen judge decisions rather than selecting a judge on its own.
+For verified joint failures, use a four-cell sample and `--measure joint`. If the optional `--judge` file is supplied, it must contain `candidate_id` and a Boolean `failure` decision for every population candidate; the estimator corrects those predictions with the human audit sample. As specified in Section 5.5 of the paper, the automated oracle uses Llama-4-Maverick. The discovery runner defaults to `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, and the answer-preservation and output-correctness prompts are included in [`VLTest/verification.py`](VLTest/verification.py).
 
 ## Dependencies and assets
 
